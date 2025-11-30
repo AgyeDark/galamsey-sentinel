@@ -1,0 +1,12 @@
+Python junk
+pycache/*.py[cod]*$py.class.ipynb_checkpoints
+
+/Environment files
+.envvenv/env/
+
+IDE files
+.vscode/.idea/
+
+Local images generated during testing
+
+*.png*.jpg
