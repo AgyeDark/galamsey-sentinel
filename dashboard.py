@@ -175,3 +175,6 @@ if st.sidebar.button("Run Analysis", type="primary"):
 
         else:
             st.warning("No data found. Try lowering the threshold or checking different dates.")
+
+        st.divider()
+st.markdown("<p style='text-align: center; color: #888888;'>© 2025 Agyei Darko | Galamsey Sentinel Tracker </p>", unsafe_allow_html=True)
