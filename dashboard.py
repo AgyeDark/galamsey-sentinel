@@ -7,12 +7,13 @@ import pandas as pd
 import plotly.express as px
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import io 
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Galamsey Sentinel (Calibrated)", page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="Galamsey Sentinel Pro", page_icon="🛰️", layout="wide")
 
-st.title("🇬🇭 Galamsey Sentinel Tracker")
-st.markdown("**Calibrated Remote Sensing Tool** | Adjust thresholds to detect high-sediment flows.")
+st.title("🇬🇭 Galamsey Sentinel Tracker Pro")
+st.markdown("**Calibrated Remote Sensing Tool** | Monitor river turbidity with Scientific Indices & True Color verification.")
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("1. Location & Time")
@@ -29,18 +30,21 @@ selected_river = st.sidebar.selectbox("Select River Basin", list(river_options.k
 bbox = river_options[selected_river]
 
 year = st.sidebar.slider("Select Year", 2017, 2024, 2023)
-max_cloud = st.sidebar.slider("Max Cloud Cover (%)", 0, 50, 20)
 
-# --- NEW CALIBRATION SECTION ---
+# CLOUD SLIDER EXPLANATION
+max_cloud = st.sidebar.slider("Max Cloud Cover (%)", 0, 50, 20, 
+    help="Filter out bad images. Lower = Clearer images but fewer data points. Higher = More data but risk of cloud noise.")
+
+# --- CALIBRATION & VIEW SETTINGS ---
 st.sidebar.divider()
 st.sidebar.header("2. Sensor Calibration")
-st.sidebar.info("💡 If the river looks 'False Clear', lower the Water Mask Threshold.")
 
-# Standard NDWI threshold is 0.0. For muddy water, we often need -0.05 or -0.1
+view_mode = st.sidebar.radio("Visualization Mode:", ["Scientific Heatmap (NDTI)", "True Color (RGB)"])
+
 mask_threshold = st.sidebar.slider(
     "Water Mask Threshold (NDWI)", 
     -0.2, 0.2, 0.0, 0.01,
-    help="Lower this value to detect muddier water. If too low, it will mistakenly include land."
+    help="Lower this value (e.g., to -0.1) if the river is missing. Muddy water often looks like land to the satellite."
 )
 
 # --- FUNCTIONS ---
@@ -59,26 +63,43 @@ def fetch_satellite_data(bbox, year, cloud_cover):
     items = search.item_collection()
     return sorted(items, key=lambda i: i.properties["datetime"])
 
+def normalize(band):
+    """Normalize band for RGB display"""
+    band = band.astype(float)
+    return (band - band.min()) / (band.max() - band.min())
+
 def process_image(item):
-    href_red = item.assets["B04"].href
+    # Fetch bands
+    href_blue = item.assets["B02"].href
     href_green = item.assets["B03"].href
+    href_red = item.assets["B04"].href
     href_nir = item.assets["B08"].href
 
+    # Read bands (downsampled 8x)
     with rasterio.open(href_red) as src:
         red = src.read(1, out_shape=(src.height // 8, src.width // 8))
     with rasterio.open(href_green) as src:
         green = src.read(1, out_shape=(src.height // 8, src.width // 8))
+    with rasterio.open(href_blue) as src:
+        blue = src.read(1, out_shape=(src.height // 8, src.width // 8))
     with rasterio.open(href_nir) as src:
         nir = src.read(1, out_shape=(src.height // 8, src.width // 8))
 
     np.seterr(divide='ignore', invalid='ignore')
-    r, g, n = red.astype(float), green.astype(float), nir.astype(float)
+    r, g, b, n = red.astype(float), green.astype(float), blue.astype(float), nir.astype(float)
     
     # Indices
-    ndti = (r - g) / (r + g) # Turbidity
-    ndwi = (g - n) / (g + n) # Water Detection
+    ndti = (r - g) / (r + g) 
+    ndwi = (g - n) / (g + n) 
     
-    return ndti, ndwi, item.datetime
+    # Create RGB Stack
+    rgb = np.dstack((normalize(r), normalize(g), normalize(b))) * 3.5
+    rgb = np.clip(rgb, 0, 1)
+    
+    # Get Metadata
+    cloud_pct = item.properties.get("eo:cloud_cover", 0)
+    
+    return ndti, ndwi, rgb, item.datetime, cloud_pct
 
 # --- MAIN APP LOGIC ---
 
@@ -87,24 +108,20 @@ if st.sidebar.button("Run Analysis", type="primary"):
         items = fetch_satellite_data(bbox, year, max_cloud)
         
     if not items:
-        st.error("No clear images found. Try increasing cloud cover.")
+        st.error("No clear images found. Try increasing the 'Max Cloud Cover' slider.")
     else:
-        st.success(f"Processing {len(items)} scenes with Threshold {mask_threshold}...")
+        st.success(f"Processing {len(items)} scenes...")
         
         progress_bar = st.progress(0)
         results = []
         
         for i, item in enumerate(items):
             try:
-                ndti, ndwi, date = process_image(item)
-                
-                # --- THE FIX: DYNAMIC MASKING ---
-                # We use the user-selected threshold instead of hardcoded 0.0
+                ndti, ndwi, rgb, date, cloud = process_image(item)
                 river_pixels = ndti[ndwi > mask_threshold]
                 
-                if len(river_pixels) > 50: # Minimum pixels to count as valid
+                if len(river_pixels) > 50:
                     avg_turbidity = np.nanmean(river_pixels)
-                    # Filter outlier noise
                     if -0.5 < avg_turbidity < 0.8:
                         results.append({"Date": date, "Turbidity": avg_turbidity})
             except:
@@ -115,66 +132,102 @@ if st.sidebar.button("Run Analysis", type="primary"):
             df = pd.DataFrame(results)
             df = df.sort_values("Date")
             
-            # 1. METRICS
+            # METRICS
             avg_annual = df["Turbidity"].mean()
             col1, col2, col3 = st.columns(3)
-            col1.metric("Avg Turbidity (NDTI)", f"{avg_annual:.3f}")
-            col2.metric("Data Points", len(df))
+            col1.metric("Avg Turbidity", f"{avg_annual:.3f}")
+            col2.metric("Usable Images", len(df))
             
-            # Recalibrate Status Logic
             if avg_annual > 0.1: status = "CRITICAL (Heavy Sediment)"
             elif avg_annual > 0.0: status = "MODERATE (Visible Turbidity)"
             else: status = "CLEAR"
-            col3.metric("Status", status)
+            col3.metric("River Status", status)
 
             st.divider()
 
-            # 2. TREND CHART
-            st.subheader(f"📉 Turbidity Trend ({year})")
-            fig = px.line(df, x="Date", y="Turbidity", markers=True)
-            fig.update_traces(line_color='#8B4513', line_width=3)
+            # LATEST MAP VIEW
+            st.subheader(f"🗺️ Satellite View: {view_mode}")
             
-            # Update Danger Zones for High Sediment
-            fig.add_hrect(y0=0.1, y1=0.5, line_width=0, fillcolor="red", opacity=0.1, annotation_text="Heavy Galamsey")
-            fig.add_hrect(y0=0.0, y1=0.1, line_width=0, fillcolor="orange", opacity=0.1, annotation_text="Moderate")
-            fig.add_hrect(y0=-0.3, y1=0.0, line_width=0, fillcolor="blue", opacity=0.1, annotation_text="Clear")
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 3. DEBUG VIEW (LATEST IMAGE)
-            st.divider()
-            st.subheader("🛠️ Calibration View (Latest Scene)")
-            
+            # Process latest image
             last_item = items[-1]
-            ndti, ndwi, date = process_image(last_item)
+            ndti, ndwi, rgb, date, cloud_pct = process_image(last_item)
+            date_str = date.strftime('%Y-%m-%d')
             
-            # Apply the user's mask
-            masked_ndti = np.ma.masked_where(ndwi <= mask_threshold, ndti)
-            
-            col_map, col_mask = st.columns(2)
+            col_map, col_info = st.columns([3, 1])
             
             with col_map:
-                st.write("**Detected River (Masked)**")
-                fig_map, ax = plt.subplots(figsize=(8, 8))
-                cmap = mcolors.LinearSegmentedColormap.from_list("galamsey", ["blue", "cyan", "yellow", "red", "brown"])
-                ax.imshow(masked_ndti, cmap=cmap, vmin=-0.1, vmax=0.3)
+                fig_map, ax = plt.subplots(figsize=(10, 8))
+                
+                if view_mode == "True Color (RGB)":
+                    ax.imshow(rgb)
+                    ax.set_title(f"True Color: {date_str} (Clouds: {cloud_pct}%)")
+                    filename = f"TrueColor_{selected_river}_{date_str}.png"
+                else:
+                    masked_ndti = np.ma.masked_where(ndwi <= mask_threshold, ndti)
+                    cmap = mcolors.LinearSegmentedColormap.from_list("galamsey", ["blue", "cyan", "yellow", "red", "brown"])
+                    ax.imshow(masked_ndti, cmap=cmap, vmin=-0.1, vmax=0.3)
+                    ax.set_title(f"Turbidity Heatmap: {date_str}")
+                    filename = f"Heatmap_{selected_river}_{date_str}.png"
+                
                 ax.axis('off')
                 st.pyplot(fig_map)
                 
-            with col_mask:
-                st.write("**Raw Water Mask (Yellow = Selected)**")
-                st.write(f"Showing pixels where NDWI > {mask_threshold}")
-                fig_mask, ax2 = plt.subplots(figsize=(8, 8))
-                # Show what the computer thinks is water
-                mask_display = (ndwi > mask_threshold).astype(int)
-                ax2.imshow(mask_display, cmap="viridis") 
-                ax2.axis('off')
-                st.pyplot(fig_mask)
+                # DOWNLOAD IMAGE BUTTON
+                buf = io.BytesIO()
+                fig_map.savefig(buf, format="png", bbox_inches='tight', dpi=150)
+                buf.seek(0)
                 
-            st.caption(f"Scene Date: {date.strftime('%Y-%m-%d')}")
+                st.download_button(
+                    label=f"📥 Download {view_mode} Image",
+                    data=buf,
+                    file_name=filename,
+                    mime="image/png"
+                )
+                
+            with col_info:
+                st.markdown("### 📝 Analysis Note")
+                st.info(f"**Scene Metadata:**\n- **Date:** {date_str}\n- **Cloud Cover:** {cloud_pct}%")
+                
+                if view_mode == "True Color (RGB)":
+                    st.markdown("""
+                    **What you are seeing:**
+                    This is the raw optical image.
+                    - **Brown:** Suspended Sediment (Mud).
+                    - **White:** Clouds.
+                    - **Green:** Forest/Vegetation.
+                    
+                    *Use this to verify if the Heatmap is telling the truth.*
+                    """)
+                else:
+                    st.markdown(f"""
+                    **What you are seeing:**
+                    A computed Index (NDTI) identifying pollution.
+                    
+                    - **Current Threshold:** {mask_threshold}
+                    - **Brown/Red:** High pollution detected.
+                    - **Missing River?** If the river is gone, it means the water is SO muddy the satellite thinks it is land. **Lower the Threshold slider.**
+                    """)
+
+            # TREND CHART
+            st.divider()
+            st.subheader(f"📉 Annual Trend ({year})")
+            fig = px.line(df, x="Date", y="Turbidity", markers=True)
+            fig.update_traces(line_color='#8B4513', line_width=3)
+            fig.add_hrect(y0=0.1, y1=0.5, line_width=0, fillcolor="red", opacity=0.1, annotation_text="Heavy Galamsey")
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # DOWNLOAD DATA BUTTON
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Trend Data (CSV)",
+                data=csv,
+                file_name=f"turbidity_trend_{selected_river}_{year}.csv",
+                mime="text/csv"
+            )
 
         else:
-            st.warning("No data found. Try lowering the threshold or checking different dates.")
+            st.warning("No valid data points found.")
 
         st.divider()
-st.markdown("<p style='text-align: center; color: #888888;'>© 2025 Agyei Darko | Galamsey Sentinel Tracker </p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #888888;'>© 2025 Agyei Darko | Virtual Catchment Laboratory</p>", unsafe_allow_html=True)
